@@ -115,7 +115,7 @@ def progress_hook(d, chat_id):
             if chat_id not in download_status or \
                current_progress - download_status.get(chat_id, {}).get('progress', 0) >= PROGRESS_INTERVAL:
                 send_message(chat_id, f"⬇️ Downloading... {progress}")
-                download_status[chat_id] = {'progress : current_progress}
+                download_status[chat_id] = {'progress' : current_progress}
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
