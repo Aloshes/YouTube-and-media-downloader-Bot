@@ -5,7 +5,7 @@ import json
 import requests
 from flask import Flask, request, jsonify
 import yt_dlp as youtube_dl
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 # Configure logging
 logging.basicConfig(
@@ -20,15 +20,15 @@ TOKEN = os.environ['BOT_TOKEN']
 API_URL = f"https://api.telegram.org/bot{TOKEN}/"
 DONATION_URL = "https://www.buymeacoffee.com/yourusername"
 
-# YouTube DL configuration (no login required)
+# YouTube DL configuration
 YDL_OPTS = {
     'quiet': True,
     'no_check_certificate': True,
-    'ignoreerrors': True,
+    'ignoreerrors': False,
     'force_generic_extractor': True,
     'geo_bypass': True,
     'referer': 'https://www.youtube.com/',
-    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'cookiefile': None,
 }
 
@@ -60,21 +60,31 @@ def get_video_keyboard(url):
     try:
         ydl = youtube_dl.YoutubeDL(YDL_OPTS)
         info = ydl.extract_info(url, download=False)
-        formats = info.get('formats', [])
         
+        if not info:
+            logging.error("Failed to get video info")
+            return None
+            
+        formats = info.get('formats', [])
+        if not formats:
+            logging.error("No formats available")
+            return None
+
         buttons = []
         for f in formats:
-            if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
+            if f.get('vcodec') != 'none':  # Relaxed check for video formats
                 quality = f.get('format_note') or f"{f.get('height', '?')}p"
+                ext = f.get('ext', 'mp4')
                 buttons.append([{
-                    'text': f"{quality} ({f['ext']})",
+                    'text': f"{quality} ({ext})",
                     'callback_data': f"vid_{f['format_id']}_{quote(url)}"
                 }])
-        
-        return {'inline_keyboard': buttons}
+
+        return {'inline_keyboard': buttons[:10]}  # Limit to first 10 formats
+
     except Exception as e:
         logging.error(f"Error getting video formats: {str(e)}")
-        return {'inline_keyboard': []}
+        return None
 
 def get_audio_keyboard(url):
     keyboard = {
@@ -112,11 +122,10 @@ def download_media(url, chat_id, ydl_opts=None, is_video=True):
                 base_opts.update(ydl_opts)
             
             # Bypass age restriction
-            if 'youtube.com' in url or 'youtu.be' in url:
-                url = url.replace('youtube.com/watch?v=', 'youtube.com/embed/')
-                
+            clean_url = url.replace('youtube.com/watch?v=', 'youtube.com/embed/')
+            
             with youtube_dl.YoutubeDL(base_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = ydl.extract_info(clean_url, download=True)
                 filepath = ydl.prepare_filename(info)
                 
                 if is_video:
@@ -131,12 +140,12 @@ def download_media(url, chat_id, ydl_opts=None, is_video=True):
                                     files={'audio': f})
                 
     except youtube_dl.utils.DownloadError as e:
+        error_msg = f"❌ Download error: {str(e)}"
         if "Private video" in str(e):
-            send_message(chat_id, "❌ This video is private and cannot be downloaded")
+            error_msg = "❌ This video is private"
         elif "Members-only content" in str(e):
-            send_message(chat_id, "❌ This is members-only content")
-        else:
-            send_message(chat_id, f"❌ Download error: {str(e)}")
+            error_msg = "❌ Members-only content"
+        send_message(chat_id, error_msg)
         logging.error(f"Download failed: {str(e)}")
     except Exception as e:
         send_message(chat_id, f"❌ Error: {str(e)}")
@@ -160,11 +169,11 @@ def webhook():
         if text.startswith('/start'):
             send_message(chat_id, 
                 "📥 *YouTube & Media Download Bot*\n\n"
-                "Send me any YouTube link or direct media URL!\n"
+                "Send me any YouTube link to download videos or audio!\n"
                 "Features:\n"
-                "- No login required\n"
                 "- Multiple quality options\n"
-                "- Audio extraction\n\n"
+                "- MP3/M4A conversion\n"
+                "- No size limits\n\n"
                 "Commands:\n"
                 "/donate - Support development\n"
                 "/help - Show help", None)
@@ -180,18 +189,19 @@ def webhook():
         elif text.startswith('/help'):
             send_message(chat_id, 
                 "ℹ️ *Help*\n\n"
-                "Just send me:\n"
-                "- YouTube URL for video/audio options\n"
-                "- Direct media URL to download\n\n"
-                "For large files, I'll automatically handle them.\n"
-                "Note: Some videos might have download restrictions.")
+                "Just send a YouTube URL and choose options!\n"
+                "1. Send YouTube link\n"
+                "2. Choose Video/Audio\n"
+                "3. Select quality/format\n"
+                "4. Wait for download!\n\n"
+                "Note: Some videos might have restrictions.")
         
         elif 'youtube.com' in text or 'youtu.be' in text:
             process_youtube(text, chat_id)
         
         else:
             try:
-                headers = {'User-Agent': 'Mozilla/5.0'}
+                headers = {'User-Agent': YDL_OPTS['user_agent']}
                 response = requests.head(text, headers=headers, timeout=10)
                 content_type = response.headers.get('Content-Type', '')
                 
@@ -211,17 +221,20 @@ def webhook():
         data = cq['data']
         chat_id = cq['message']['chat']['id']
         message_id = cq['message']['message_id']
-        url = requests.utils.unquote(data.split('_')[-1])
+        url = unquote(data.split('_')[-1])
         
         try:
             if data.startswith('yt_video_'):
                 keyboard = get_video_keyboard(url)
-                requests.post(API_URL + 'editMessageText', json={
-                    'chat_id': chat_id,
-                    'message_id': message_id,
-                    'text': 'Select video quality:',
-                    'reply_markup': json.dumps(keyboard)
-                })
+                if keyboard:
+                    requests.post(API_URL + 'editMessageText', json={
+                        'chat_id': chat_id,
+                        'message_id': message_id,
+                        'text': 'Available video qualities:',
+                        'reply_markup': json.dumps(keyboard)
+                    })
+                else:
+                    send_message(chat_id, "❌ Failed to get video formats")
             
             elif data.startswith('yt_audio_'):
                 keyboard = get_audio_keyboard(url)
@@ -273,7 +286,7 @@ def webhook():
 
 @app.route('/')
 def home():
-    return 'YouTube & Media Download Bot is running!'
+    return 'YouTube Download Bot is Running!'
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
