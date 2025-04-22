@@ -134,7 +134,7 @@ def webhook():
     return jsonify({'status': 'ok'})
 
 if __name__ == '__main__':
-    app.run(port=5000) ```python
+    app.run(port=5000)
 # Ensure to set the webhook for your bot after deploying
 # You can set the webhook using the following command:
 # curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=<YOUR_WEBHOOK_URL>"
