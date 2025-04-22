@@ -1,9 +1,10 @@
 import os
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-import yt_dlp as youtube_dl
+import tempfile
+import json
 import requests
+from flask import Flask, request, jsonify
+import yt_dlp as youtube_dl
 
 # Configure logging
 logging.basicConfig(
@@ -11,213 +12,244 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Telegram Bot Token
-TOKEN = os.getenv('BOT_TOKEN')
+app = Flask(__name__)
 
-# Buy Me a Coffee URL
+# Configuration
+TOKEN = os.environ['BOT_TOKEN']
+API_URL = f"https://api.telegram.org/bot{TOKEN}/"
 DONATION_URL = "https://www.buymeacoffee.com/yourusername"
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB Telegram limit
+LAST_PROGRESS = {}  # Track progress updates per chat
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hi! Send me a URL to download media or a YouTube link for video/audio downloads."
-    )
+def send_message(chat_id, text, reply_markup=None):
+    data = {
+        'chat_id': chat_id,
+        'text': text,
+        'parse_mode': 'Markdown'
+    }
+    if reply_markup:
+        data['reply_markup'] = reply_markup
+    requests.post(API_URL + 'sendMessage', json=data)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Available commands:\n"
-        "/start - Start the bot\n"
-        "/help - Show this help message\n"
-        "/donate - Support the developer\n"
-        "\nJust send any valid URL to download media!"
-    )
-
-async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("Buy Me a Coffee ☕", url=DONATION_URL)]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "If you find this bot useful, please consider supporting:",
-        reply_markup=reply_markup
-    )
-
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text
-    if "youtube.com" in url or "youtu.be" in url:
-        await youtube_options(update, context, url)
-    else:
-        await handle_media_url(update, context, url)
-
-async def youtube_options(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    keyboard = [
-        [
-            InlineKeyboardButton("Video", callback_data=f"youtube_video_{url}"),
-            InlineKeyboardButton("Audio", callback_data=f"youtube_audio_{url}"),
+def process_youtube(url, chat_id):
+    keyboard = {
+        'inline_keyboard': [
+            [
+                {'text': '🎥 Video', 'callback_data': f'yt_video_{url}'},
+                {'text': '🎵 Audio', 'callback_data': f'yt_audio_{url}'}
+            ]
         ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "Choose download type:",
-        reply_markup=reply_markup
-    )
+    }
+    send_message(chat_id, "Choose download type:", json.dumps(keyboard))
 
-async def youtube_video_qualities(update: Update, url: str):
-    ydl_opts = {'quiet': True, 'extract_flat': True}
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+def get_video_keyboard(url):
+    try:
+        ydl = youtube_dl.YoutubeDL({'quiet': True})
         info = ydl.extract_info(url, download=False)
         formats = info.get('formats', [])
-    
-    buttons = []
-    for f in formats:
-        if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
-            res = f.get('format_note', f.get('height'))
-            buttons.append(
-                InlineKeyboardButton(
-                    f"{res}p ({f['ext']})",
-                    callback_data=f"video_{f['format_id']}_{url}"
-                )
-            )
-    
-    keyboard = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "Available video qualities:",
-        reply_markup=reply_markup
-    )
-
-async def youtube_audio_options(update: Update, url: str):
-    keyboard = [
-        [
-            InlineKeyboardButton("MP3", callback_data=f"audio_mp3_{url}"),
-            InlineKeyboardButton("M4A", callback_data=f"audio_m4a_{url}"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "Choose audio format:",
-        reply_markup=reply_markup
-    )
-
-async def audio_quality_options(update: Update, url: str, format_type: str):
-    keyboard = [
-        [
-            InlineKeyboardButton("High", callback_data=f"{format_type}_high_{url}"),
-            InlineKeyboardButton("Medium", callback_data=f"{format_type}_medium_{url}"),
-            InlineKeyboardButton("Low", callback_data=f"{format_type}_low_{url}"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "Choose audio quality:",
-        reply_markup=reply_markup
-    )
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    url = data.split('_')[-1]
-    
-    if data.startswith('youtube_video'):
-        await youtube_video_qualities(query, url)
-    elif data.startswith('youtube_audio'):
-        await youtube_audio_options(query, url)
-    elif data.startswith('audio_mp3') or data.startswith('audio_m4a'):
-        await audio_quality_options(query, url, data.split('_')[1])
-    elif data.startswith('mp3_') or data.startswith('m4a_'):
-        await download_audio(update, context, data)
-    elif data.startswith('video_'):
-        await download_video(update, context, data)
-    
-    await query.answer()
-
-async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    query = update.callback_query
-    format_id = data.split('_')[1]
-    url = '_'.join(data.split('_')[2:])
-    
-    ydl_opts = {
-        'format': format_id,
-        'outtmpl': '%(title)s.%(ext)s',
-    }
-    
-    await query.edit_message_text("Downloading video...")
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-    
-    await context.bot.send_video(
-        chat_id=query.message.chat_id,
-        video=open(filename, 'rb'),
-        caption=info['title']
-    )
-    os.remove(filename)
-
-async def download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    query = update.callback_query
-    parts = data.split('_')
-    format_type = parts[0]
-    quality = parts[1]
-    url = '_'.join(parts[2:])
-    
-    format_map = {
-        'mp3': {
-            'high': 'bestaudio/best',
-            'medium': 'worstaudio/worst',
-            'low': 'worstaudio/worst'
-        },
-        'm4a': {
-            'high': 'bestaudio[ext=m4a]',
-            'medium': 'worstaudio[ext=m4a]',
-            'low': 'worstaudio[ext=m4a]'
-        }
-    }
-    
-    ydl_opts = {
-        'format': format_map[format_type][quality],
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': format_type,
-            'preferredquality': '320' if quality == 'high' else '128' if quality == 'medium' else '64'
-        }],
-        'outtmpl': '%(title)s.%(ext)s',
-    }
-    
-    await query.edit_message_text("Downloading audio...")
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info).replace('.webm', f'.{format_type}')
-    
-    await context.bot.send_audio(
-        chat_id=query.message.chat_id,
-        audio=open(filename, 'rb'),
-        title=info['title']
-    )
-    os.remove(filename)
-
-async def handle_media_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    try:
-        response = requests.head(url)
-        content_type = response.headers.get('Content-Type', '')
         
-        if 'image' in content_type:
-            await update.message.reply_photo(url)
-        elif 'video' in content_type:
-            await update.message.reply_video(url)
-        elif 'audio' in content_type:
-            await update.message.reply_audio(url)
-        else:
-            await update.message.reply_text("Unsupported media type")
+        buttons = []
+        for f in formats:
+            if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
+                quality = f.get('format_note') or f"{f.get('height', '?')}p"
+                buttons.append([{
+                    'text': f"{quality} ({f['ext']})",
+                    'callback_data': f"vid_{f['format_id']}_{url}"
+                }])
+        
+        return {'inline_keyboard': buttons}
     except Exception as e:
-        await update.message.reply_text(f"Error downloading media: {str(e)}")
+        logging.error(f"Error getting video formats: {str(e)}")
+        return {'inline_keyboard': []}
 
-def main():
-    application = Application.builder().token(TOKEN).build()
+def get_audio_keyboard(url):
+    keyboard = {
+        'inline_keyboard': [
+            [
+                {'text': 'MP3', 'callback_data': f'aud_mp3_{url}'},
+                {'text': 'M4A', 'callback_data': f'aud_m4a_{url}'}
+            ]
+        ]
+    }
+    return keyboard
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("donate", donate))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    application.add_handler(CallbackQueryHandler(handle_callback))
+def get_quality_keyboard(url, format_type):
+    keyboard = {
+        'inline_keyboard': [
+            [
+                {'text': 'High', 'callback_data': f'{format_type}_high_{url}'},
+                {'text': 'Medium', 'callback_data': f'{format_type}_med_{url}'},
+                {'text': 'Low', 'callback_data': f'{format_type}_low_{url}'}
+            ]
+        ]
+    }
+    return keyboard
 
-    application.run_polling()
+def download_file(url, chat_id, ydl_opts=None, is_video=True):
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_opts = {
+                'outtmpl': f'{tmpdir}/%(title)s.%(ext)s',
+                'quiet': True,
+                'progress_hooks': [lambda d: progress_hook(d, chat_id)]
+            }
+            
+            if ydl_opts:
+                base_opts.update(ydl_opts)
+            
+            with youtube_dl.YoutubeDL(base_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filepath = ydl.prepare_filename(info)
+                
+                if os.path.getsize(filepath) > MAX_FILE_SIZE:
+                    send_message(chat_id, "❌ File too large (max 50MB)")
+                    return
+
+                if is_video:
+                    with open(filepath, 'rb') as f:
+                        requests.post(API_URL + 'sendVideo',
+                                    data={'chat_id': chat_id},
+                                    files={'video': f})
+                else:
+                    with open(filepath, 'rb') as f:
+                        requests.post(API_URL + 'sendAudio',
+                                    data={'chat_id': chat_id},
+                                    files={'audio': f})
+                
+                # Cleanup progress tracking
+                if chat_id in LAST_PROGRESS:
+                    del LAST_PROGRESS[chat_id]
+                    
+    except Exception as e:
+        send_message(chat_id, f"❌ Error: {str(e)}")
+        logging.error(f"Download failed: {str(e)}")
+
+def progress_hook(d, chat_id):
+    if d['status'] == 'downloading':
+        progress = d.get('_percent_str', '')
+        # Throttle progress updates to 5% increments
+        if progress and (chat_id not in LAST_PROGRESS or 
+                       (float(progress.strip('%')) - LAST_PROGRESS[chat_id]) >= 5):
+            send_message(chat_id, f"⬇️ Downloading... {progress}")
+            LAST_PROGRESS[chat_id] = float(progress.strip('%'))
+
+@app.route(f'/{TOKEN}', methods=['POST'])
+def webhook():
+    update = request.get_json()
+    
+    if 'message' in update:
+        msg = update['message']
+        chat_id = msg['chat']['id']
+        text = msg.get('text', '')
+        
+        if text.startswith('/start'):
+            send_message(chat_id, 
+                "📥 *Media Download Bot*\n\n"
+                "Send me a YouTube link or direct media URL!\n"
+                "Commands:\n"
+                "/donate - Support development\n"
+                "/help - Show help", None)
+        
+        elif text.startswith('/donate'):
+            send_message(chat_id, f"Support us: {DONATION_URL}")
+        
+        elif text.startswith('/help'):
+            send_message(chat_id, 
+                "Help:\n"
+                "- Send YouTube link for video/audio options\n"
+                "- Send direct media URL to get file\n"
+                "- Max file size: 50MB")
+        
+        elif 'youtube.com' in text or 'youtu.be' in text:
+            process_youtube(text, chat_id)
+        
+        else:
+            # Handle direct media URLs
+            try:
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                response = requests.head(text, headers=headers, timeout=5)
+                content_type = response.headers.get('Content-Type', '')
+                
+                if 'video' in content_type:
+                    requests.post(API_URL + 'sendVideo', 
+                               json={'chat_id': chat_id, 'video': text})
+                elif 'audio' in content_type:
+                    requests.post(API_URL + 'sendAudio',
+                               json={'chat_id': chat_id, 'audio': text})
+                else:
+                    send_message(chat_id, "❌ Unsupported media type")
+            except Exception as e:
+                send_message(chat_id, f"❌ Failed to download media: {str(e)}")
+    
+    elif 'callback_query' in update:
+        cq = update['callback_query']
+        data = cq['data']
+        chat_id = cq['message']['chat']['id']
+        message_id = cq['message']['message_id']
+        url = data.split('_')[-1]
+        
+        try:
+            if data.startswith('yt_video_'):
+                keyboard = get_video_keyboard(url)
+                requests.post(API_URL + 'editMessageText', json={
+                    'chat_id': chat_id,
+                    'message_id': message_id,
+                    'text': 'Select video quality:',
+                    'reply_markup': json.dumps(keyboard)
+                })
+            
+            elif data.startswith('yt_audio_'):
+                keyboard = get_audio_keyboard(url)
+                requests.post(API_URL + 'editMessageText', json={
+                    'chat_id': chat_id,
+                    'message_id': message_id,
+                    'text': 'Select audio format:',
+                    'reply_markup': json.dumps(keyboard)
+                })
+            
+            elif data.startswith('aud_'):
+                parts = data.split('_')
+                format_type = parts[1]
+                keyboard = get_quality_keyboard(url, format_type)
+                requests.post(API_URL + 'editMessageText', json={
+                    'chat_id': chat_id,
+                    'message_id': message_id,
+                    'text': 'Select audio quality:',
+                    'reply_markup': json.dumps(keyboard)
+                })
+            
+            elif data.startswith(('mp3_', 'm4a_')):
+                parts = data.split('_')
+                format_type = parts[0]
+                quality = parts[1]
+                ydl_opts = {
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': format_type,
+                        'preferredquality': '320' if quality == 'high' else '192' if quality == 'med' else '128'
+                    }]
+                }
+                download_file(url, chat_id, ydl_opts=ydl_opts, is_video=False)
+            
+            elif data.startswith('vid_'):
+                format_id = data.split('_')[1]
+                ydl_opts = {'format': format_id}
+                download_file(url, chat_id, ydl_opts=ydl_opts, is_video=True)
+            
+        except Exception as e:
+            send_message(chat_id, f"❌ Error processing request: {str(e)}")
+            logging.error(f"Callback error: {str(e)}")
+        
+        # Answer callback query
+        requests.post(API_URL + 'answerCallbackQuery', 
+                    json={'callback_query_id': cq['id']})
+    
+    return jsonify({'status': 'ok'})
+
+@app.route('/')
+def home():
+    return 'Media Download Bot is running!'
 
 if __name__ == '__main__':
-    main()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
